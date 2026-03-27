@@ -3,13 +3,14 @@ package config
 import (
 	"errors"
 	"os"
+	"log/slog"
 	"github.com/joho/godotenv"
 )
 
 type Config struct {
 	DatabaseURL  string
 	RedisURL     string
-	KafkaBrokers []string
+	KafkaBroker string
 	WebhookURL   string
 	APIPort      string
 }
@@ -21,7 +22,7 @@ func Load() *Config {
 	return &Config{
 		DatabaseURL:  getEnv("DATABASE_URL", "postgres://localhost:5432/notifications_db"),
 		RedisURL:     getEnv("REDIS_URL", "localhost:6379"),
-		KafkaBrokers: []string{getEnv("KAFKA_BROKER", "localhost:9092")},
+		KafkaBroker: getEnv("KAFKA_BROKER", "localhost:9092"),
 		WebhookURL:   getEnv("WEBHOOK_URL", "https://webhook.site/default"),
 		APIPort:      getEnv("API_PORT", ":8080"),
 	}
@@ -35,8 +36,40 @@ func getEnv(key, fallback string) string {
 }
 
 func (c *Config) Validate() error {
-	if c.DatabaseURL == "" { return errors.New("DATABASE_URL zorunlu") }
-	if c.RedisURL == "" { return errors.New("REDIS_URL zorunlu") }
-	if len(c.KafkaBrokers) == 0 || c.KafkaBrokers[0] == "" { return errors.New("KAFKA_BROKER zorunlu") }
+	// Load() fonksiyonunda atanan varsayılan değerler
+	defaults := map[string]string{
+		"DATABASE_URL": "postgres://localhost:5432/notifications_db",
+		"REDIS_URL":    "localhost:6379",
+		"KAFKA_BROKER": "localhost:9092",
+		"WEBHOOK_URL":  "https://webhook.site/default",
+	}
+
+	env := map[string]string{
+		"DATABASE_URL": c.DatabaseURL,
+		"REDIS_URL":    c.RedisURL,
+		"KAFKA_BROKER": c.KafkaBroker,
+		"WEBHOOK_URL":  c.WebhookURL,
+	}
+
+	// Varsayılan değer kullanımı varsa loglara uyarı bas
+	for key, def := range defaults {
+		if env[key] == def {
+			slog.Warn("DIKKAT: Ortam degiskeni default degerle calisiyor (Production icin riskli olabilir)", 
+				"key", key, 
+				"value", def,
+			)
+		}
+	}
+
+	// Webhook URL dış dünya ile iletişim kurduğu için default bırakılmasına kesinlikle izin verme
+	if c.WebhookURL == defaults["WEBHOOK_URL"] || c.WebhookURL == "" {
+		return errors.New("KRITIK HATA: WEBHOOK_URL production ortaminda zorunludur ve default birakilamaz")
+	}
+
+	// İsteğe bağlı: Port boş olamaz kontrolü
+	if c.ServerPort == "" {
+		return errors.New("SERVER_PORT bos olamaz")
+	}
+
 	return nil
 }

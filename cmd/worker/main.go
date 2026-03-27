@@ -59,7 +59,7 @@ func main() {
 
 	// Dead Letter Queue Writer'ı başlat
 	dlqWriter := &kafka.Writer{
-		Addr:     kafka.TCP(cfg.KafkaBrokers[0]),
+		Addr:     kafka.TCP(cfg.KafkaBroker),
 		Topic:    "notifications-dlq",
 		Balancer: &kafka.LeastBytes{},
 	}
@@ -125,7 +125,7 @@ func main() {
 func startConsumerGroup(ctx context.Context, globalWg *sync.WaitGroup, topic string, processor *internalworker.Processor, workerCount int, cfg *config.Config) {
 	
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:  cfg.KafkaBrokers,
+		Brokers:  []string{cfg.KafkaBroker},
 		GroupID:  "notification-workers", 
 		Topic:    topic,
 		MinBytes: 10e3,

@@ -49,7 +49,7 @@ func main() {
 	// 2. Kafka Writer (Producer) Ayarları
 	// DİKKAT: Topic alanını boş bırakıyoruz ki mesaj bazlı dinamik topic atayabilelim.
 	kafkaWriter := &kafka.Writer{
-		Addr:     kafka.TCP(cfg.KafkaBrokers[0]),
+		Addr:     kafka.TCP(cfg.KafkaBroker),
 		// Topic:    "notifications-normal", // Gerçekte priority'ye göre topic seçilebilir
 		Balancer: &kafka.LeastBytes{},    // Yükü partition'lara eşit dağıt
 
