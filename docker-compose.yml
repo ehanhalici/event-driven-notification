@@ -18,6 +18,11 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   kafka:
     image: apache/kafka:latest
@@ -36,7 +41,6 @@ services:
       KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
-
   db-migrate:
     image: migrate/migrate:v4.18.3
     container_name: insider_db_migrate
@@ -47,8 +51,7 @@ services:
       - "-database=postgres://insider:secretpassword@postgres:5432/notifications_db?sslmode=disable"
       - "up"
     depends_on:
-      postgres:
-        condition: service_healthy
+      postgres: { condition: service_healthy }
     restart: "no"
 
   kafka-init:
@@ -67,8 +70,7 @@ services:
         /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:29092 --replication-factor 1 --partitions 3 --topic notifications-low
         /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:29092 --replication-factor 1 --partitions 3 --topic notifications-dlq
     depends_on:
-      kafka:
-        condition: service_started
+      kafka: { condition: service_started }
     restart: "no"
 
   app-api:
@@ -76,7 +78,9 @@ services:
     container_name: insider_api
     restart: unless-stopped
     ports: ["8080:8080"]
-    env_file: [.env]
+    env_file:
+      - path: .env
+        required: false
     environment:
       # ---> [KRİTİK]: Docker içi adresleri burada eziyoruz <---
       - DATABASE_URL=postgres://insider:secretpassword@postgres:5432/notifications_db
@@ -84,42 +88,39 @@ services:
       - KAFKA_BROKER=kafka:29092
     command: ["/app/api"]
     depends_on:
-      postgres:
-        condition: service_healthy
-      kafka:
-        condition: service_started
-      db-migrate:
-        condition: service_completed_successfully
-      kafka-init:
-        condition: service_completed_successfully
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_started }
+      db-migrate: { condition: service_completed_successfully }
+      kafka-init: { condition: service_completed_successfully }
 
   app-relay:
     build: .
     container_name: insider_relay
     restart: unless-stopped
     ports: ["9094:9094"]
-    env_file: [.env]
+    env_file:
+      - path: .env
+        required: false
     environment:
       # ---> [KRİTİK]: localhost yerine servis isimlerini yazıyoruz <---
       - DATABASE_URL=postgres://insider:secretpassword@postgres:5432/notifications_db
       - KAFKA_BROKER=kafka:29092
     command: ["/app/relay"]
     depends_on:
-      postgres:
-        condition: service_healthy
-      kafka:
-        condition: service_started
-      db-migrate:
-        condition: service_completed_successfully
-      kafka-init:
-        condition: service_completed_successfully
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_started }
+      db-migrate: { condition: service_completed_successfully }
+      kafka-init: { condition: service_completed_successfully }
 
   app-worker:
     build: .
     container_name: insider_worker
     restart: unless-stopped
     ports: ["9091:9091"]
-    env_file: [.env]
+    env_file:
+      - path: .env
+        required: false
     environment:
       # ---> [KRİTİK]: localhost yerine servis isimlerini yazıyoruz <---
       - KAFKA_BROKER=kafka:29092
@@ -127,13 +128,8 @@ services:
       - REDIS_URL=redis:6379
     command: ["/app/worker"]
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_started
-      kafka:
-        condition: service_started
-      db-migrate:
-        condition: service_completed_successfully
-      kafka-init:
-        condition: service_completed_successfully
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_started }
+      db-migrate: { condition: service_completed_successfully }
+      kafka-init: { condition: service_completed_successfully }

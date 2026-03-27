@@ -1,17 +1,18 @@
 package repository
 
 import (
-	"fmt"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"insider-notification/internal/logger"
+	"insider-notification/internal/models"
 	"time"
-	"encoding/base64"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5" // ErrNoRows icin gerekli
 	"github.com/jackc/pgx/v5/pgxpool"
-	"insider-notification/internal/models"
-	"insider-notification/internal/logger"
 )
 
 type DB struct {
@@ -39,14 +40,14 @@ func (db *DB) CreateNotificationWithOutbox(ctx context.Context, req models.Notif
 
 	//  Outbox'a Req değil, ID içeren Payload yazılıyor # todo buradaki karmasayi duzelt
 	internalPayload := models.NotificationPayload{
-		ID:       notifID,
+		ID:            notifID,
 		CorrelationID: corrID,
-		Recipient: req.Recipient,
-		Channel:  req.Channel,
-		Content:  req.Content,
-		Priority: req.Priority,
+		Recipient:     req.Recipient,
+		Channel:       req.Channel,
+		Content:       req.Content,
+		Priority:      req.Priority,
 	}
-	
+
 	payload, err := json.Marshal(internalPayload)
 	if err != nil {
 		return err
@@ -88,7 +89,6 @@ func (db *DB) LockNotificationForProcessing(ctx context.Context, id string) (boo
 	return true, nil
 }
 
-
 // 3 - Toplu Bildirim Oluşturma (Batch Creation)
 func (db *DB) CreateNotificationBatchWithOutbox(ctx context.Context, requests []models.NotificationRequest, batchID string) error {
 	tx, err := db.Pool.Begin(ctx)
@@ -119,15 +119,15 @@ func (db *DB) CreateNotificationBatchWithOutbox(ctx context.Context, requests []
         `, notifID, batchID, req.IdempotencyKey, req.Recipient, req.Channel, req.Content, req.Priority, corrID)
 		// Outbox payload'unu hazırla
 		internalPayload := models.NotificationPayload{
-			ID:       notifID,
+			ID:            notifID,
 			CorrelationID: corrID,
-			Recipient: req.Recipient,
-			Channel:  req.Channel,
-			Content:  req.Content,
-			Priority: req.Priority,
+			Recipient:     req.Recipient,
+			Channel:       req.Channel,
+			Content:       req.Content,
+			Priority:      req.Priority,
 		}
 		payloadBytes, err := json.Marshal(internalPayload)
-		if err != nil{
+		if err != nil {
 			return fmt.Errorf("payload marshal error for %s: %w", notifID, err)
 		}
 
@@ -141,7 +141,7 @@ func (db *DB) CreateNotificationBatchWithOutbox(ctx context.Context, requests []
 	// Tüm kuyruğu TEK SEFERDE veritabanına gönder (Round-trip optimizasyonu)
 	br := tx.SendBatch(ctx, batch)
 	// ---> [KRİTİK DÜZELTME]: Güvenlik için defer ile kapatmayı garantiye al
-	defer br.Close() 
+	defer br.Close()
 
 	// ---> [KRİTİK DÜZELTME]: pgx Sürücü İterasyonu <---
 	// Gönderdiğimiz her bir sorgunun sonucunu ve hatasını tek tek okumalıyız.
@@ -153,11 +153,11 @@ func (db *DB) CreateNotificationBatchWithOutbox(ctx context.Context, requests []
 		}
 	}
 	err = br.Close()
-    if err != nil {
-        return fmt.Errorf("batch close error: %w", err)
-    }
+	if err != nil {
+		return fmt.Errorf("batch close error: %w", err)
+	}
 
-	return tx.Commit(ctx)	
+	return tx.Commit(ctx)
 
 }
 
@@ -184,19 +184,33 @@ func (db *DB) GetNotificationsByBatchID(ctx context.Context, batchID string) ([]
 	return results, nil
 }
 
-
-// İptal İşlemi (Sadece pending durumundakiler iptal edilebilir)
-func (db *DB) CancelNotification(ctx context.Context, id string) (bool, error) {
-	tag, err := db.Pool.Exec(ctx, `
+// İptal İşlemi (Henüz tamamlanmamış tüm durumlar iptal edilebilir)
+func (db *DB) CancelNotification(ctx context.Context, id string) (canceled bool, currentStatus string, err error) {
+	// Tek atomik sorgu: iptal et ve yeni durumu döndür
+	err = db.Pool.QueryRow(ctx, `
 		UPDATE notifications 
 		SET status = 'canceled', updated_at = NOW() 
-		WHERE id = $1 AND (status = 'pending' OR status = 'failed_retrying')
-	`, id)
+		WHERE id = $1 AND status IN ('pending', 'failed_retrying', 'processing')
+		RETURNING status
+	`, id).Scan(&currentStatus)
+
 	if err != nil {
-		return false, err
+		if errors.Is(err, pgx.ErrNoRows) {
+			// UPDATE 0 satır etkiledi → ya kayıt yok ya da terminal durumda
+			// Mevcut durumu öğrenmek için ayrı sorgu
+			qErr := db.Pool.QueryRow(ctx, `SELECT status FROM notifications WHERE id = $1`, id).Scan(&currentStatus)
+			if qErr != nil {
+				if errors.Is(qErr, pgx.ErrNoRows) {
+					return false, "", nil // Kayıt yok
+				}
+				return false, "", qErr
+			}
+			return false, currentStatus, nil // Kayıt var ama iptal edilemez durumda
+		}
+		return false, "", err
 	}
-	// Eğer güncellenen satır sayısı 0 ise, ya mesaj yoktur ya da artık pending değildir
-	return tag.RowsAffected() > 0, nil
+
+	return true, "canceled", nil
 }
 
 // Tekil Bildirim Getirme
@@ -206,11 +220,11 @@ func (db *DB) GetNotificationByID(ctx context.Context, id string) (*models.Notif
 		SELECT id, batch_id, external_id, idempotency_key, recipient, channel, content, priority, status, retry_count, next_retry_at, created_at, updated_at 
 		FROM notifications WHERE id = $1
 	`, id).Scan(
-		&n.ID, &n.BatchID, &n.ExternalID, &n.IdempotencyKey, &n.Recipient, 
-		&n.Channel, &n.Content, &n.Priority, &n.Status, &n.RetryCount, 
+		&n.ID, &n.BatchID, &n.ExternalID, &n.IdempotencyKey, &n.Recipient,
+		&n.Channel, &n.Content, &n.Priority, &n.Status, &n.RetryCount,
 		&n.NextRetryAt, &n.CreatedAt, &n.UpdatedAt,
 	)
-	
+
 	if err != nil {
 		return nil, err // Kayıt yoksa pgx.ErrNoRows döner
 	}

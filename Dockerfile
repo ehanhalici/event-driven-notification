@@ -37,6 +37,7 @@ WORKDIR /app
 COPY --from=builder /bin/api /app/api
 COPY --from=builder /bin/worker /app/worker
 COPY --from=builder /bin/relay /app/relay
+COPY --from=builder /app/docs /app/docs
 
 # Portları belgele (API: 8080, Worker Metrics: 9091, Relay Metrics: 9094)
 EXPOSE 8080 9091 9094

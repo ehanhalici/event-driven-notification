@@ -36,7 +36,14 @@ Designed to handle millions of notifications (SMS, Email, Push) with strict idem
 * Go 1.22+
 
 ### 1. Bootstrapping the Infrastructure
-First, ensure you have your `.env` file configured. Then, spin up PostgreSQL, Redis, and Kafka using Docker Compose:
+First, copy the environment template and configure your Webhook URL:
+
+```bash
+cp .env.example .env
+# Edit .env and set your WEBHOOK_URL (get one from https://webhook.site)
+```
+
+Then spin up PostgreSQL, Redis, and Kafka using Docker Compose:
 
 ```bash
 make up
@@ -66,10 +73,13 @@ chmod +x stress_test.sh
 
 1.  **`POST /notifications`** - Create a single notification (Requires Idempotency Key).
 2.  **`POST /notifications/batch`** - Create up to 1000 notifications in a single transaction.
-3.  **`GET /notifications`** - List notifications (Supports Keyset Pagination cursor, limit, status, channel filters).
-4.  **`GET /notifications/batch/{id}`** - Get the status of a specific batch.
-5.  **`DELETE /notifications/{id}`** - Cancel a pending notification (Fast-fail).
-6.  **`GET /health`** - System health check (Postgres & Redis ping).
+3.  **`GET /notifications`** - List notifications (Supports Keyset Pagination cursor, limit, status, channel, date range filters).
+4.  **`GET /notifications/{id}`** - Get notification details and current status by ID.
+5.  **`GET /notifications/batch/{id}`** - Get the status of a specific batch.
+6.  **`DELETE /notifications/{id}`** - Cancel a pending/retrying notification (Fast-fail via Redis flag).
+7.  **`GET /health`** - System health check (Postgres & Redis ping).
+8.  **`GET /metrics`** - Prometheus metrics (queue depth, success/failure rates, latency).
+9.  **`GET /swagger`** - Swagger UI (serves `/swagger/swagger.json` and `/swagger/swagger.yaml`).
 
 ---
 
@@ -82,4 +92,13 @@ By default, the worker attempts to forward processed notifications to `https://w
 3.  Update the `.env` file in the project root: 
     `WEBHOOK_URL=https://webhook.site/your-unique-uuid`
 4.  Restart the worker (`make run-worker`) and send a `POST /notifications` request to watch the messages arrive in real-time!
+
+## Running Tests
+
+```bash
+# Unit tests (no external dependencies required)
+go test ./internal/models/...
+
+# All tests (requires PostgreSQL and Redis running)
+make test
 ```

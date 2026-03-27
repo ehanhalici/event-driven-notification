@@ -1,0 +1,280 @@
+basePath: /
+definitions:
+  models.NotificationRequest:
+    properties:
+      channel:
+        type: string
+      content:
+        type: string
+      idempotency_key:
+        type: string
+      priority:
+        type: string
+      recipient:
+        type: string
+    type: object
+  models.NotificationResponse:
+    properties:
+      batch_id:
+        type: string
+      channel:
+        type: string
+      content:
+        type: string
+      created_at:
+        type: string
+      external_id:
+        type: string
+      id:
+        type: string
+      idempotency_key:
+        type: string
+      next_retry_at:
+        type: string
+      priority:
+        type: string
+      recipient:
+        type: string
+      retry_count:
+        type: integer
+      status:
+        type: string
+      updated_at:
+        type: string
+    type: object
+host: localhost:8080
+info:
+  contact: {}
+  description: Event-driven scalable notification system API.
+  title: Insider Notification API
+  version: "1.0"
+paths:
+  /health:
+    get:
+      description: Veritabanı ve Redis bağlantılarını anlık kontrol eder.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Tüm sistemler ayakta
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "503":
+          description: Servislerden biri veya daha fazlası çökmüş
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Sistem Sağlık Durumu
+      tags:
+      - system
+  /notifications:
+    get:
+      description: Filtreleme ve Keyset Cursor destekli yüksek performanslı bildirim
+        listesi getirir.
+      parameters:
+      - description: Duruma göre filtrele (pending, processing, delivered, failed_retrying,
+          failed_permanently, canceled)
+        in: query
+        name: status
+        type: string
+      - description: Kanala göre filtrele (sms, email, push)
+        in: query
+        name: channel
+        type: string
+      - description: Başlangıç tarihi filtresi (ISO8601 veya YYYY-MM-DD)
+        in: query
+        name: start_date
+        type: string
+      - description: Bitiş tarihi filtresi (ISO8601 veya YYYY-MM-DD)
+        in: query
+        name: end_date
+        type: string
+      - description: Sayfa boyutu (varsayılan 10, max 100)
+        in: query
+        name: limit
+        type: integer
+      - description: Bir sonraki sayfa için imleç (next_cursor)
+        in: query
+        name: cursor
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Bildirimleri Listele
+      tags:
+      - notifications
+    post:
+      consumes:
+      - application/json
+      description: Transactional Outbox pattern kullanarak asenkron tekil bildirim
+        işler.
+      parameters:
+      - description: Bildirim Bilgileri
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/models.NotificationRequest'
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Bildirim alindi, isleniyor
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Gecersiz JSON veya bilinmeyen alan
+          schema:
+            type: string
+        "409":
+          description: Idempotency key cakismasi
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Rate limit asildi
+          schema:
+            type: string
+        "500":
+          description: Veritabanina yazilamadi
+          schema:
+            type: string
+      summary: Tekil bildirim oluşturur
+      tags:
+      - notifications
+  /notifications/{id}:
+    delete:
+      description: Bekleyen veya tekrar denenecek bir bildirimi iptal eder. Redis
+        fast-fail bayrağı ile Kafka'daki işlenmesini durdurur.
+      parameters:
+      - description: Notification ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Bildirim basariyla iptal edildi
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Gecersiz ID formati
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Bildirim bulunamadi
+          schema:
+            type: string
+        "409":
+          description: Bildirim terminal durumda, iptal edilemez
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Bildirim İptal Et
+      tags:
+      - notifications
+    get:
+      description: ID'ye göre bildirimin detaylarını ve son durumunu getirir.
+      parameters:
+      - description: Notification ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/models.NotificationResponse'
+        "404":
+          description: Bildirim bulunamadi
+          schema:
+            type: string
+      summary: Tekil Bildirim Getir
+      tags:
+      - notifications
+  /notifications/batch:
+    post:
+      consumes:
+      - application/json
+      description: Transactional Outbox pattern kullanarak asenkron toplu bildirim
+        (maksimum 1000 adet) işler.
+      parameters:
+      - description: Bildirim Listesi
+        in: body
+        name: request
+        required: true
+        schema:
+          items:
+            $ref: '#/definitions/models.NotificationRequest'
+          type: array
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Toplu bildirimler alindi, isleniyor
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Gecersiz JSON array formatı, bos liste veya limit asimi
+          schema:
+            type: string
+        "409":
+          description: Idempotency key cakismasi
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Rate limit asildi
+          schema:
+            type: string
+        "500":
+          description: Toplu veritabani yazma islemi basarisiz
+          schema:
+            type: string
+      summary: Toplu bildirim oluşturur
+      tags:
+      - notifications
+  /notifications/batch/{id}:
+    get:
+      description: Batch ID'ye ait tüm bildirimlerin durumlarını listeler.
+      parameters:
+      - description: Batch ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/models.NotificationResponse'
+            type: array
+      summary: Toplu Bildirim Durumunu Getir
+      tags:
+      - notifications
+swagger: "2.0"

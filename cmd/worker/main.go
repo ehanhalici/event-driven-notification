@@ -2,25 +2,26 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
-	"errors"
-	"net/http"
-	
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/redis/go-redis/v9"
-	"github.com/segmentio/kafka-go"
+
+	"insider-notification/internal/circuitbreaker"
 	"insider-notification/internal/config"
+	"insider-notification/internal/logger"
 	"insider-notification/internal/ratelimit"
 	"insider-notification/internal/repository"
-	"insider-notification/internal/logger"
-	"insider-notification/internal/circuitbreaker"
 	internalworker "insider-notification/internal/worker"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
+	"github.com/segmentio/kafka-go"
 )
 
 func main() {
@@ -41,8 +42,7 @@ func main() {
 		slog.Info("Kapanis sinyali alindi, Graceful Shutdown...")
 		cancel()
 	}()
-	
-	
+
 	// 1. Veritabanı (Postgres)
 	dbPool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -65,11 +65,10 @@ func main() {
 	}
 	defer dlqWriter.Close()
 
-
 	// Dağıtık Devre Kesici (Distributed Circuit Breaker) Ayarları
 	// Kural: 10 saniyelik pencerede toplam 10 hata alınırsa, devreyi 30 saniye boyunca TÜM SİSTEM İÇİN aç!
 	distCB := circuitbreaker.NewDistributedCB(
-		rdb, 
+		rdb,
 		"webhook_main", // Benzersiz şalter ismi
 		10,             // maxFailures
 		10*time.Second, // window (Hata sayma penceresi)
@@ -84,9 +83,8 @@ func main() {
 		CB:         distCB, // [GÜNCELLENDİ]
 		WebhookURL: cfg.WebhookURL,
 	}
-	
-	slog.Info("Worker basladi. Kafka topic dinleniyor...")
 
+	slog.Info("Worker basladi. Kafka topic dinleniyor...")
 
 	// Worker havuzlarını beklemesi için WaitGroup
 	var wg sync.WaitGroup
@@ -104,7 +102,7 @@ func main() {
 	go func() {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
-		slog.Info("Worker Metrik sunucusu baslatildi", "port", ":9091") 
+		slog.Info("Worker Metrik sunucusu baslatildi", "port", ":9091")
 		if err := http.ListenAndServe(":9091", mux); err != nil {
 			slog.Error("Metrik sunucusu hatasi", "error", err)
 		}
@@ -115,18 +113,16 @@ func main() {
 	slog.Info("Sistem guvenle kapatildi.")
 }
 
-
-
 // Neden 60 Reader yerine 1 Reader + Worker Pool?
-// Çünkü Kafka topic'inin partition sayısından fazla açılan Kafka Reader'lar 
+// Çünkü Kafka topic'inin partition sayısından fazla açılan Kafka Reader'lar
 // tamamen boşta (IDLE) bekler ve network/memory sızıntısına yol açar.
-// Doğru tasarım: Kafka'dan tek bir Reader ile veriyi olabildiğince hızlı çekip (Fetch), 
+// Doğru tasarım: Kafka'dan tek bir Reader ile veriyi olabildiğince hızlı çekip (Fetch),
 // Go channel'lar vasıtasıyla N adet yerel Goroutine (Worker) havuzuna dağıtmaktır.
 func startConsumerGroup(ctx context.Context, globalWg *sync.WaitGroup, topic string, processor *internalworker.Processor, workerCount int, cfg *config.Config) {
-	
+
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:  []string{cfg.KafkaBroker},
-		GroupID:  "notification-workers", 
+		GroupID:  "notification-workers",
 		Topic:    topic,
 		MinBytes: 10e3,
 		MaxBytes: 10e6,
@@ -135,6 +131,10 @@ func startConsumerGroup(ctx context.Context, globalWg *sync.WaitGroup, topic str
 	// Mesajların aktarılacağı tamponlu (buffered) kanal.
 	// Worker sayısının 2 katı buffer koyarak Fetcher'ın tıkanmasını (blocking) önlüyoruz.
 	msgChan := make(chan kafka.Message, workerCount*2)
+
+	// ---> [KRİTİK DÜZELTME]: Watermark tabanlı offset commit tracker <---
+	// Paralel worker'ların out-of-order commit yaparak mesaj kaybetmesini önler.
+	tracker := internalworker.NewCommitTracker(reader, topic)
 
 	// Sadece bu topic'e ait worker'ların kapandığını takip etmek için yerel WaitGroup
 	var localWg sync.WaitGroup
@@ -145,7 +145,7 @@ func startConsumerGroup(ctx context.Context, globalWg *sync.WaitGroup, topic str
 	for i := 0; i < workerCount; i++ {
 		globalWg.Add(1)
 		localWg.Add(1)
-		
+
 		go func(workerID int) {
 			defer globalWg.Done()
 			defer localWg.Done()
@@ -154,9 +154,9 @@ func startConsumerGroup(ctx context.Context, globalWg *sync.WaitGroup, topic str
 
 			// Kanal açık olduğu sürece (Fetch devam ettikçe) mesajları sırayla al ve işle
 			for msg := range msgChan {
-				processor.Process(ctx, msg, reader)
+				processor.Process(ctx, msg, tracker)
 			}
-			
+
 			slog.Info("Worker kapaniyor...", "topic", topic, "worker_id", workerID)
 		}(i)
 	}
@@ -181,18 +181,20 @@ func startConsumerGroup(ctx context.Context, globalWg *sync.WaitGroup, topic str
 				}
 				break // Hata veya iptal durumunda Fetch döngüsünden çık
 			}
-			
+
+			// Mesajı tracker'a kaydet (worker dispatch'ten ÖNCE)
+			tracker.Track(msg)
 			// Okunan mesajı havuza (Worker'lara) gönder
 			msgChan <- msg
 		}
 
 		// --- GRACEFUL SHUTDOWN (ZARİF KAPANIŞ) KOREOGRAFİSİ ---
-		
-		// 1. Önce kanalı kapatıyoruz ki Worker'lar yeni mesaj gelmeyeceğini anlasın 
+
+		// 1. Önce kanalı kapatıyoruz ki Worker'lar yeni mesaj gelmeyeceğini anlasın
 		// ve ellerindeki mevcut mesajları bitirince for-range döngüsünden çıksınlar.
 		close(msgChan)
 
-		// 2. Worker'ların ellerindeki son mesajları işlemelerini ve Kafka'ya 
+		// 2. Worker'ların ellerindeki son mesajları işlemelerini ve Kafka'ya
 		// COMMIT etmelerini bekliyoruz. (Eğer beklemeksizin reader.Close yapsaydık,
 		// worker'ların içindeki CommitMessages fonksiyonu hata fırlatırdı!)
 		localWg.Wait()
