@@ -36,6 +36,41 @@ services:
       KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
+
+  db-migrate:
+    image: migrate/migrate:v4.18.3
+    container_name: insider_db_migrate
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - "-path=/migrations"
+      - "-database=postgres://insider:secretpassword@postgres:5432/notifications_db?sslmode=disable"
+      - "up"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  kafka-init:
+    image: apache/kafka:latest
+    container_name: insider_kafka_init
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        until /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list >/dev/null 2>&1; do
+          echo "Waiting for Kafka broker..."
+          sleep 2
+        done
+        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:29092 --replication-factor 1 --partitions 3 --topic notifications-high
+        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:29092 --replication-factor 1 --partitions 3 --topic notifications-normal
+        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:29092 --replication-factor 1 --partitions 3 --topic notifications-low
+        /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server kafka:29092 --replication-factor 1 --partitions 3 --topic notifications-dlq
+    depends_on:
+      kafka:
+        condition: service_started
+    restart: "no"
+
   app-api:
     build: .
     container_name: insider_api
@@ -49,8 +84,14 @@ services:
       - KAFKA_BROKER=kafka:29092
     command: ["/app/api"]
     depends_on:
-      postgres: { condition: service_healthy }
-      kafka: { condition: service_started }
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      db-migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
 
   app-relay:
     build: .
@@ -64,8 +105,14 @@ services:
       - KAFKA_BROKER=kafka:29092
     command: ["/app/relay"]
     depends_on:
-      postgres: { condition: service_healthy }
-      kafka: { condition: service_started }
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      db-migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
 
   app-worker:
     build: .
@@ -80,5 +127,13 @@ services:
       - REDIS_URL=redis:6379
     command: ["/app/worker"]
     depends_on:
-      postgres: { condition: service_healthy }
-      redis: { condition: service_started }
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      kafka:
+        condition: service_started
+      db-migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully

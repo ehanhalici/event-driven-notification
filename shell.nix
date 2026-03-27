@@ -16,6 +16,8 @@ pkgs.mkShell {
     jq
     curl
     go-migrate
+    go-swag
+    code-cursor
   ];
 
   shellHook = ''

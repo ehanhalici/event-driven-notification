@@ -65,11 +65,5 @@ func (c *Config) Validate() error {
 	if c.WebhookURL == defaults["WEBHOOK_URL"] || c.WebhookURL == "" {
 		return errors.New("KRITIK HATA: WEBHOOK_URL production ortaminda zorunludur ve default birakilamaz")
 	}
-
-	// İsteğe bağlı: Port boş olamaz kontrolü
-	if c.ServerPort == "" {
-		return errors.New("SERVER_PORT bos olamaz")
-	}
-
 	return nil
 }

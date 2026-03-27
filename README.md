@@ -34,7 +34,6 @@ Designed to handle millions of notifications (SMS, Email, Push) with strict idem
 ### Prerequisites
 * Docker & Docker Compose
 * Go 1.22+
-* `golang-migrate` CLI tool
 
 ### 1. Bootstrapping the Infrastructure
 First, ensure you have your `.env` file configured. Then, spin up PostgreSQL, Redis, and Kafka using Docker Compose:
@@ -44,30 +43,14 @@ make up
 # or: docker-compose up -d --build
 ```
 
-### 2. Run Database Migrations & Kafka Topics
-Once the infrastructure is up, you need to apply the initial SQL schemas (Outbox and Notification tables) and create the required Kafka topics (`notifications-high`, `normal`, `low`, `dlq`).
+### 2. Automatic Bootstrap (Migrations + Kafka Topics)
+`docker compose up` now runs two one-shot init services automatically:
+- `db-migrate`: applies SQL migrations
+- `kafka-init`: creates required topics (`notifications-high`, `notifications-normal`, `notifications-low`, `notifications-dlq`)
 
-We have a dedicated script to handle this automatically:
-```bash
-chmod +x create_migrations_and_kafka_topics.sh
-./create_migrations_and_kafka_topics.sh
-```
+App services start only after these init steps complete successfully.
 
-### 3. Start the Microservices
-The system consists of three main components. Open three separate terminal tabs and start the services:
-
-```bash
-# Terminal 1: Starts the REST API (Port :8080)
-make run-api
-
-# Terminal 2: Starts the Outbox Relay (Reads from Postgres -> Writes to Kafka)
-make run-relay
-
-# Terminal 3: Starts the Notification Worker (Reads from Kafka -> Forwards to Webhook)
-make run-worker
-```
-
-### 4. System Load & Stress Testing
+### 3. System Load & Stress Testing
 To demonstrate the system's capabilities (Rate Limiting, Batch Processing, and concurrency), a built-in stress test script is provided. It sends a combination of single and batch requests to the API.
 
 While the services are running, execute the following script in a new terminal:

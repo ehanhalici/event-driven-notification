@@ -20,6 +20,11 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// @title Insider Notification API
+// @version 1.0
+// @description Event-driven scalable notification system API.
+// @host localhost:8080
+// @BasePath /
 func main() {
 	logger.Setup()
 	cfg := config.Load()
@@ -58,7 +63,7 @@ func main() {
 		Addr:    cfg.APIPort,
 		Handler: handler, // Zırhlanmış handler'ı veriyoruz
 	}
-	
+
 	// Sunucuyu arka planda (goroutine) başlat
 	go func() {
 		slog.Info("API Server baslatiliyor", "port", cfg.APIPort)
@@ -84,5 +89,5 @@ func main() {
 	}
 
 	slog.Info("API Sunucusu guvenle kapatildi.")
-	
+
 }
