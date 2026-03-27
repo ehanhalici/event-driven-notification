@@ -14,6 +14,7 @@ import (
 	"insider-notification/internal/circuitbreaker"
 	"insider-notification/internal/config"
 	"insider-notification/internal/logger"
+	"insider-notification/internal/metrics"
 	"insider-notification/internal/ratelimit"
 	"insider-notification/internal/repository"
 	internalworker "insider-notification/internal/worker"
@@ -27,7 +28,7 @@ import (
 func main() {
 	logger.Setup()
 	cfg := config.Load()
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.ValidateWorker(); err != nil {
 		slog.Error("Konfigurasyon eksik veya hatali (Uygulama baslatilamiyor)", "error", err)
 		os.Exit(1)
 	}
@@ -154,7 +155,10 @@ func startConsumerGroup(ctx context.Context, globalWg *sync.WaitGroup, topic str
 
 			// Kanal açık olduğu sürece (Fetch devam ettikçe) mesajları sırayla al ve işle
 			for msg := range msgChan {
+				metrics.ActiveWorkers.WithLabelValues(topic).Inc()
+				metrics.InFlightMessages.WithLabelValues(topic).Dec()
 				processor.Process(ctx, msg, tracker)
+				metrics.ActiveWorkers.WithLabelValues(topic).Dec()
 			}
 
 			slog.Info("Worker kapaniyor...", "topic", topic, "worker_id", workerID)
@@ -184,6 +188,7 @@ func startConsumerGroup(ctx context.Context, globalWg *sync.WaitGroup, topic str
 
 			// Mesajı tracker'a kaydet (worker dispatch'ten ÖNCE)
 			tracker.Track(msg)
+			metrics.InFlightMessages.WithLabelValues(topic).Inc()
 			// Okunan mesajı havuza (Worker'lara) gönder
 			msgChan <- msg
 		}

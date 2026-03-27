@@ -98,27 +98,17 @@ func TestLoad_CustomValues(t *testing.T) {
 
 // --- Validate Testleri ---
 
-func TestValidate_DefaultWebhookShouldFail(t *testing.T) {
+func TestValidate_DefaultWebhookShouldPass(t *testing.T) {
+	// Validate() artik WEBHOOK_URL kontrolu yapmiyor (sadece uyari loglar).
+	// WEBHOOK_URL kontrolu ValidateWorker()'da yapilir.
 	cfg := &Config{
 		DatabaseURL: "postgres://custom:5432/db",
 		RedisURL:    "custom:6379",
 		KafkaBroker: "custom:9092",
 		WebhookURL:  "https://webhook.site/default",
 	}
-	if err := cfg.Validate(); err == nil {
-		t.Error("Varsayilan webhook URL ile Validate basarili olmamali")
-	}
-}
-
-func TestValidate_EmptyWebhookShouldFail(t *testing.T) {
-	cfg := &Config{
-		DatabaseURL: "postgres://custom:5432/db",
-		RedisURL:    "custom:6379",
-		KafkaBroker: "custom:9092",
-		WebhookURL:  "",
-	}
-	if err := cfg.Validate(); err == nil {
-		t.Error("Bos webhook URL ile Validate basarili olmamali")
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() API/Relay icin hata vermemeli, alinan: %v", err)
 	}
 }
 
@@ -134,15 +124,40 @@ func TestValidate_CustomWebhookShouldPass(t *testing.T) {
 	}
 }
 
-func TestValidate_AllDefaultsShouldWarnButPassIfWebhookCustom(t *testing.T) {
-	// Tüm degerler varsayilan ama webhook özel → Validate geçmeli (logda uyari çıkar)
+// --- ValidateWorker Testleri ---
+
+func TestValidateWorker_DefaultWebhookShouldFail(t *testing.T) {
 	cfg := &Config{
-		DatabaseURL: "postgres://localhost:5432/notifications_db",
-		RedisURL:    "localhost:6379",
-		KafkaBroker: "localhost:9092",
+		DatabaseURL: "postgres://custom:5432/db",
+		RedisURL:    "custom:6379",
+		KafkaBroker: "custom:9092",
+		WebhookURL:  "https://webhook.site/default",
+	}
+	if err := cfg.ValidateWorker(); err == nil {
+		t.Error("Varsayilan webhook URL ile ValidateWorker basarili olmamali")
+	}
+}
+
+func TestValidateWorker_EmptyWebhookShouldFail(t *testing.T) {
+	cfg := &Config{
+		DatabaseURL: "postgres://custom:5432/db",
+		RedisURL:    "custom:6379",
+		KafkaBroker: "custom:9092",
+		WebhookURL:  "",
+	}
+	if err := cfg.ValidateWorker(); err == nil {
+		t.Error("Bos webhook URL ile ValidateWorker basarili olmamali")
+	}
+}
+
+func TestValidateWorker_CustomWebhookShouldPass(t *testing.T) {
+	cfg := &Config{
+		DatabaseURL: "postgres://custom:5432/db",
+		RedisURL:    "custom:6379",
+		KafkaBroker: "custom:9092",
 		WebhookURL:  "https://real-production-webhook.com/api",
 	}
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("Webhook özel oldugu halde Validate basarisiz oldu: %v", err)
+	if err := cfg.ValidateWorker(); err != nil {
+		t.Errorf("Gecerli webhook URL ile ValidateWorker basarisiz olmamali, hata: %v", err)
 	}
 }

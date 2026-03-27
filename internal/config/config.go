@@ -54,15 +54,24 @@ func (c *Config) Validate() error {
 	// Varsayılan değer kullanımı varsa loglara uyarı bas
 	for key, def := range defaults {
 		if env[key] == def {
-			slog.Warn("DIKKAT: Ortam degiskeni default degerle calisiyor (Production icin riskli olabilir)", 
-				"key", key, 
+			slog.Warn("DIKKAT: Ortam degiskeni default degerle calisiyor (Production icin riskli olabilir)",
+				"key", key,
 				"value", def,
 			)
 		}
 	}
 
-	// Webhook URL dış dünya ile iletişim kurduğu için default bırakılmasına kesinlikle izin verme
-	if c.WebhookURL == defaults["WEBHOOK_URL"] || c.WebhookURL == "" {
+	return nil
+}
+
+// ValidateWorker, worker servisi için ek validasyonlar yapar.
+// WEBHOOK_URL sadece worker servisi tarafından kullanıldığından,
+// bu kontrol ortak Validate() yerine burada yapılır.
+func (c *Config) ValidateWorker() error {
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	if c.WebhookURL == "https://webhook.site/default" || c.WebhookURL == "" {
 		return errors.New("KRITIK HATA: WEBHOOK_URL production ortaminda zorunludur ve default birakilamaz")
 	}
 	return nil

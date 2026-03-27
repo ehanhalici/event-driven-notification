@@ -86,6 +86,7 @@ func (h *Handler) HandleCreateNotification(w http.ResponseWriter, r *http.Reques
 		slog.ErrorContext(r.Context(), "Token Bucket Limiter hatasi, fail-open devreye girdi", "err", err)
 	} else if !allowed {
 		slog.WarnContext(r.Context(), "Tekil istek Rate Limit asimi", "ip", ip)
+		metrics.RateLimitHitsTotal.WithLabelValues("token_bucket").Inc()
 		jsonError(w, "Rate limit asildi", http.StatusTooManyRequests)
 		return
 	}
@@ -114,6 +115,9 @@ func (h *Handler) HandleCreateNotification(w http.ResponseWriter, r *http.Reques
 		jsonError(w, "Veritabanina yazilamadi: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Metrik: Oluşturulan bildirim sayacı
+	metrics.NotificationsCreatedTotal.WithLabelValues(req.Channel).Inc()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -176,6 +180,7 @@ func (h *Handler) HandleCreateNotificationBatch(w http.ResponseWriter, r *http.R
 		slog.ErrorContext(r.Context(), "Token Bucket Limiter hatasi, fail-open devreye girdi", "err", err)
 	} else if !allowed {
 		slog.WarnContext(r.Context(), "Toplu istek Rate Limit asimi", "ip", ip, "requested_tokens", weight)
+		metrics.RateLimitHitsTotal.WithLabelValues("token_bucket").Inc()
 		jsonError(w, "Rate limit asildi (Kovanizda yeterli jeton yok)", http.StatusTooManyRequests)
 		return
 	}
@@ -212,6 +217,13 @@ func (h *Handler) HandleCreateNotificationBatch(w http.ResponseWriter, r *http.R
 		jsonError(w, "Toplu veritabani yazma islemi basarisiz: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Metrik: Batch boyut dağılımı
+	metrics.NotificationBatchSize.Observe(float64(len(reqs)))
+	// Metrik: Her kanal için oluşturulan bildirim sayacı
+	for _, r := range reqs {
+		metrics.NotificationsCreatedTotal.WithLabelValues(r.Channel).Inc()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -270,6 +282,10 @@ func (h *Handler) HandleCancelNotification(w http.ResponseWriter, r *http.Reques
 			"Redis cancel flag atanamadi, worker iptal gormeyebilir",
 			"id", id, "err", err)
 	}
+
+	// Metrik: İptal edilen bildirim sayacı
+	metrics.NotificationsCanceledTotal.Inc()
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"message": "Bildirim basariyla iptal edildi"})
@@ -591,6 +607,7 @@ func RateLimitMiddleware(limiter *ratelimit.Limiter) func(http.Handler) http.Han
 			}
 			if !allowed {
 				slog.WarnContext(r.Context(), "L7 Global Flood engellendi", "ip", ip)
+				metrics.RateLimitHitsTotal.WithLabelValues("global_flood").Inc()
 				jsonError(w, "Cok fazla HTTP istegi gonderdiniz (Global Flood Protection)", http.StatusTooManyRequests)
 				return
 			}
@@ -600,16 +617,34 @@ func RateLimitMiddleware(limiter *ratelimit.Limiter) func(http.Handler) http.Han
 	}
 }
 
+// statusRecorder, HTTP handler'dan dönen status code'u yakalar.
+// Prometheus'un api_http_requests_total metriği için gereklidir.
+type statusRecorder struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	sr.statusCode = code
+	sr.ResponseWriter.WriteHeader(code)
+}
+
 // MeasureLatency, route pattern'ini alıp metrikleri güvenle (High Cardinality olmadan) işler
 func MeasureLatency(route string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// İşlem başlar başlamaz kronometreyi tut
 		timer := prometheus.NewTimer(metrics.APIRequestDuration.WithLabelValues(r.Method, route))
 
-		// Fonksiyon (handler) bitince süreyi kaydet
-		defer timer.ObserveDuration()
+		// Status code'u yakalamak için ResponseWriter'ı sar
+		recorder := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 
-		next(w, r)
+		// Fonksiyon (handler) bitince süreyi kaydet
+		defer func() {
+			timer.ObserveDuration()
+			metrics.APIRequestsTotal.WithLabelValues(r.Method, route, strconv.Itoa(recorder.statusCode)).Inc()
+		}()
+
+		next(recorder, r)
 	}
 }
 

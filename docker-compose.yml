@@ -1,4 +1,18 @@
 services:
+  # ---> [ONE-COMMAND SETUP]: Mock Webhook Servisi <---
+  # docker-compose up ile harici bir webhook.site URL'si gerekmeden tam çalışan sistem.
+  # Production'da bu servis kaldırılıp gerçek WEBHOOK_URL .env'den verilir.
+  mock-webhook:
+    image: nginx:alpine
+    container_name: insider_mock_webhook
+    volumes:
+      - ./mock-webhook.conf:/etc/nginx/conf.d/default.conf:rw
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+
   postgres:
     image: postgres:15-alpine
     environment:
@@ -126,10 +140,14 @@ services:
       - KAFKA_BROKER=kafka:29092
       - DATABASE_URL=postgres://insider:secretpassword@postgres:5432/notifications_db
       - REDIS_URL=redis:6379
+      # Mock webhook: docker-compose up ile otomatik çalışır.
+      # Gerçek webhook kullanmak için .env dosyasında WEBHOOK_URL'yi ezin.
+      - WEBHOOK_URL=${WEBHOOK_URL:-http://mock-webhook:80/webhook}
     command: ["/app/worker"]
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
       kafka: { condition: service_started }
+      mock-webhook: { condition: service_healthy }
       db-migrate: { condition: service_completed_successfully }
       kafka-init: { condition: service_completed_successfully }

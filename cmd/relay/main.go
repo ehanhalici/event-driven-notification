@@ -124,30 +124,33 @@ func main() {
 			// Worker'lar (Relay değil) mesajı işlerken statüyü kalıcı olarak 'processing' yapar.
 			// Eğer worker Kafka'dan mesajı alıp, API'ye istek atarken çökerse, mesaj 'processing' statüsünde kalır.
 			// Aşağıdaki Atomik CTE, bu zombileri bulur ve Kafka'ya yeniden atılması için Outbox'a geri besler!
-			_, err := dbPool.Exec(ctx, `
-				WITH zombie_notifications AS (
-					UPDATE notifications 
-					SET status = 'pending', updated_at = NOW()
-					WHERE status = 'processing' AND updated_at < NOW() - INTERVAL '5 minutes'
-					RETURNING id, recipient, channel, content, priority, correlation_id
-				)
-				INSERT INTO outbox_events (aggregate_id, event_type, payload)
-				SELECT id, 'ZombieRecovery', jsonb_build_object(
-					'id', id, 
-					'recipient', recipient, 
-					'channel', channel, 
-					'content', content, 
-					'priority', priority,
-					'correlation_id', correlation_id
-				)
-				FROM zombie_notifications;
-			`)
-			if err != nil {
-				slog.Error("Zombie notification kurtarma hatasi", "err", err)
-			} else {
-			    // İsteğe bağlı olarak, kaç zombinin kurtarıldığını loglayabilirsin
-			    slog.Info("Stuck job sweeper çalisti")
+		result, err := dbPool.Exec(ctx, `
+			WITH zombie_notifications AS (
+				UPDATE notifications 
+				SET status = 'pending', updated_at = NOW()
+				WHERE status = 'processing' AND updated_at < NOW() - INTERVAL '5 minutes'
+				RETURNING id, recipient, channel, content, priority, correlation_id
+			)
+			INSERT INTO outbox_events (aggregate_id, event_type, payload)
+			SELECT id, 'ZombieRecovery', jsonb_build_object(
+				'id', id, 
+				'recipient', recipient, 
+				'channel', channel, 
+				'content', content, 
+				'priority', priority,
+				'correlation_id', correlation_id
+			)
+			FROM zombie_notifications;
+		`)
+		if err != nil {
+			slog.Error("Zombie notification kurtarma hatasi", "err", err)
+		} else {
+			zombieCount := result.RowsAffected()
+			if zombieCount > 0 {
+				metrics.ZombieRecoveredTotal.Add(float64(zombieCount))
+				slog.Warn("Zombi bildirimler kurtarildi", "count", zombieCount)
 			}
+		}
 		}
 	}
 }
@@ -297,5 +300,6 @@ func processOutbox(parentCtx context.Context, db *pgxpool.Pool, writer *kafka.Wr
 	} 
 	
 	slog.Info("Outbox batch basariyla islendi", "count", len(processedIDs))
+	metrics.OutboxRelayedTotal.Add(float64(len(processedIDs)))
 	return len(processedIDs)
 }

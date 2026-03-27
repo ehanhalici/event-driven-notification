@@ -11,19 +11,17 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
 
-	// "github.com/sony/gobreaker"
+	"insider-notification/internal/circuitbreaker"
 	"insider-notification/internal/logger"
+	"insider-notification/internal/metrics"
 	"insider-notification/internal/models"
 	"insider-notification/internal/ratelimit"
 	"insider-notification/internal/repository"
-
-	"insider-notification/internal/circuitbreaker"
-	"insider-notification/internal/metrics"
-
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 type Processor struct {
@@ -55,6 +53,7 @@ func (p *Processor) Process(ctx context.Context, msg kafka.Message, tracker *Com
 	if err := json.Unmarshal(msg.Value, &payload); err != nil {
 		slog.ErrorContext(ctx, "Payload parse edilemedi, mesaj DLQ'ya aliniyor", "error", err)
 		_ = p.DLQWriter.WriteMessages(ctx, kafka.Message{Value: msg.Value})
+		metrics.KafkaDLQMessagesTotal.Inc()
 		tracker.MarkDone(ctx, msg)
 		return
 	}
@@ -63,6 +62,9 @@ func (p *Processor) Process(ctx context.Context, msg kafka.Message, tracker *Com
 	ctx = context.WithValue(ctx, logger.CorrelationIDKey, payload.CorrelationID)
 	// BUNDAN SONRA TÜM LOGLARDA traceCtx KULLANACAĞIZ!
 	slog.InfoContext(ctx, "Mesaj Kafka'dan alindi, isleniyor", "id", payload.ID)
+
+	// Metrik: Kafka'dan tüketilen mesaj sayacı
+	metrics.KafkaMessagesConsumedTotal.WithLabelValues(msg.Topic).Inc()
 
 	notifID := payload.ID
 
@@ -93,6 +95,7 @@ func (p *Processor) Process(ctx context.Context, msg kafka.Message, tracker *Com
 	allowed, err := p.Limiter.AllowSliding(ctx, payload.Channel, 100)
 	if err != nil || !allowed {
 		slog.WarnContext(ctx, "Rate limit asildi, bekletiliyor, mesaj geri atilacak", "channel", payload.Channel)
+		metrics.RateLimitHitsTotal.WithLabelValues("channel_sliding").Inc()
 		// Mesajı işleme, status'u DB'de failed_retrying yap (aşağıdaki başarısızlık mantığı ile)
 		// Rate limite takıldıysa DB'yi güncelle.
 		// Eğer DB güncellemesi başarısız olursa COMMIT ETME!
@@ -120,6 +123,9 @@ func (p *Processor) Process(ctx context.Context, msg kafka.Message, tracker *Com
 		"content": payload.Content,
 	}
 	reqBody, _ := json.Marshal(webhookPayload)
+
+	// Metrik: Webhook çağrı süresini ölç
+	webhookTimer := prometheus.NewTimer(metrics.WebhookCallDuration.WithLabelValues(payload.Channel))
 
 	result, err := p.CB.Execute(ctx, func() (interface{}, error) {
 		client := http.Client{Timeout: 5 * time.Second}
@@ -164,12 +170,20 @@ func (p *Processor) Process(ctx context.Context, msg kafka.Message, tracker *Com
 		return &whResp, nil
 	})
 
+	webhookTimer.ObserveDuration()
+
 	if err != nil {
 		if errors.Is(err, circuitbreaker.ErrCircuitOpen) {
 			slog.WarnContext(ctx, "Devre Kesici ACIK (Fast-fail), webhook'a gidilmedi")
+			metrics.WebhookCallsTotal.WithLabelValues(payload.Channel, "circuit_open").Inc()
+			metrics.CircuitBreakerState.Set(1) // 1 = open
 		} else {
 			slog.ErrorContext(ctx, "Webhook istegi basarisiz oldu", "error", err)
+			metrics.WebhookCallsTotal.WithLabelValues(payload.Channel, "error").Inc()
 		}
+	} else {
+		metrics.WebhookCallsTotal.WithLabelValues(payload.Channel, "success").Inc()
+		metrics.CircuitBreakerState.Set(0) // 0 = closed
 	}
 
 	// Closure dışına taşınan sonucu al
@@ -189,19 +203,27 @@ func (p *Processor) Process(ctx context.Context, msg kafka.Message, tracker *Com
 			externalID = &whResp.MessageID
 			slog.InfoContext(ctx, "Webhook tarafindan basariyla kabul edildi", "external_id", *externalID)
 		}
-		_, dbErr = p.Repo.Pool.Exec(ctx, `
+		// ---> [KRİTİK DÜZELTME]: Race Condition Koruması <---
+		// İptal (cancel) webhook çağrısı sırasında gelebilir. status = 'processing'
+		// kontrolü eklenerek, iptal edilen bildirimin 'delivered' ile ezilmesi önlenir.
+		var updatedStatus string
+		dbErr = p.Repo.Pool.QueryRow(ctx, `
 			UPDATE notifications 
 			SET status = 'delivered', external_id = $1, updated_at = NOW() 
-			WHERE id = $2
-		`, externalID, notifID)
+			WHERE id = $2 AND status = 'processing'
+			RETURNING status
+		`, externalID, notifID).Scan(&updatedStatus)
 
 		if dbErr == nil {
 			slog.InfoContext(ctx, "Mesaj basariyla iletildi", "id", notifID)
-			// Başarılı İşlem Sayacını Artır
 			metrics.EventsProcessed.WithLabelValues("delivered", payload.Channel).Inc()
+		} else if errors.Is(dbErr, pgx.ErrNoRows) {
+			// Bildirim işlenirken iptal edilmiş (cancel API çağrıldı)
+			slog.WarnContext(ctx, "Bildirim isleme sirasinda iptal edildi, delivered yazilmadi", "id", notifID)
+			dbErr = nil // Bu bir hata değil, beklenen durum
 		}
 	} else {
-		isPermanentFail, dbErr = p.handleFailure(ctx, notifID) // handleFailure fonksiyonunun da error dönmesini saglamalisin
+		isPermanentFail, dbErr = p.handleFailure(ctx, notifID)
 		// Hatalı İşlem Sayacını Artır
 		if isPermanentFail {
 			metrics.EventsProcessed.WithLabelValues("failed_permanently", payload.Channel).Inc()
@@ -225,6 +247,7 @@ func (p *Processor) Process(ctx context.Context, msg kafka.Message, tracker *Com
 			slog.ErrorContext(ctx, "DLQ yazmasi basarisiz, islem geri sariliyor", "id", notifID, "err", dlqErr)
 			return // DLQ'ya yazamazsak commit etmiyoruz ki kaybolmasin!
 		}
+		metrics.KafkaDLQMessagesTotal.Inc()
 	}
 
 	// Veritabanı güvenli, karşı taraf güvenli. Artık Commit edebiliriz.
@@ -233,15 +256,23 @@ func (p *Processor) Process(ctx context.Context, msg kafka.Message, tracker *Com
 
 func (p *Processor) handleFailure(ctx context.Context, id string) (bool, error) {
 	var newStatus string
+	// ---> [KRİTİK DÜZELTME]: Race Condition Koruması <---
+	// İptal edilen bildirimin retry_count artırılmasını ve 'failed_retrying' yazılmasını önlemek için
+	// status = 'processing' kontrolü eklendi. İşleme sırasında cancel gelirse 0 satır güncellenir.
 	err := p.Repo.Pool.QueryRow(ctx, `
 		UPDATE notifications 
 		SET retry_count = retry_count + 1,
 			status = CASE WHEN retry_count + 1 >= 3 THEN 'failed_permanently' ELSE 'failed_retrying' END,
 			next_retry_at = CASE WHEN retry_count + 1 >= 3 THEN NULL ELSE NOW() + (POWER(2, retry_count) * INTERVAL '1 minute') END,
 			updated_at = NOW()
-		WHERE id = $1
+		WHERE id = $1 AND status = 'processing'
 		RETURNING status
 	`, id).Scan(&newStatus)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		slog.WarnContext(ctx, "handleFailure: bildirim artik processing degil (muhtemelen iptal edildi)", "id", id)
+		return false, nil
+	}
 
 	return newStatus == "failed_permanently", err
 }
