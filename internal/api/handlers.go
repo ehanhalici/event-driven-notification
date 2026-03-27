@@ -228,6 +228,10 @@ func (h *Handler) HandleCreateNotificationBatch(w http.ResponseWriter, r *http.R
 // @Router /notifications/{id} [delete]
 func (h *Handler) HandleCancelNotification(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id") // Go 1.22 URL Path variable okuma
+	if !validateUUID(w, id) {
+		http.Error(w, "Uygun olmayan id", http.StatusBadRequest)
+		return
+	}
 
 	// 1. Veritabanından iptal et
 	canceled, err := h.Repo.CancelNotification(r.Context(), id)
@@ -261,6 +265,10 @@ func (h *Handler) HandleCancelNotification(w http.ResponseWriter, r *http.Reques
 // @Router /notifications/{id} [get]
 func (h *Handler) HandleGetNotification(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if !validateUUID(w, id) {
+		http.Error(w, "Uygun olmayan id", http.StatusBadRequest)
+		return
+	}
 
 	notif, err := h.Repo.GetNotificationByID(r.Context(), id)
 	if err != nil {
@@ -269,7 +277,7 @@ func (h *Handler) HandleGetNotification(w http.ResponseWriter, r *http.Request) 
 		} else {
 			http.Error(w, "Veritabani hatasi", http.StatusInternalServerError)
 		}
-		return  // ← KESİNLİKLE GEREKLİ
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(notif)
@@ -533,4 +541,16 @@ func MeasureLatency(route string, next http.HandlerFunc) http.HandlerFunc {
 		
 		next(w, r)
 	}
+}
+
+func validateUUID(w http.ResponseWriter, id string) bool {
+	if _, err := uuid.Parse(id); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "Gecersiz ID formati (UUID bekleniyor)",
+		})
+		return false
+	}
+	return true
 }
