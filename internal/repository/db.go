@@ -190,7 +190,7 @@ func (db *DB) CancelNotification(ctx context.Context, id string) (canceled bool,
 	err = db.Pool.QueryRow(ctx, `
 		UPDATE notifications 
 		SET status = 'canceled', updated_at = NOW() 
-		WHERE id = $1 AND status IN ('pending', 'failed_retrying', 'processing')
+		WHERE id = $1 AND status IN ('pending', 'failed_retrying')
 		RETURNING status
 	`, id).Scan(&currentStatus)
 

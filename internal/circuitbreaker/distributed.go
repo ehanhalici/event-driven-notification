@@ -139,3 +139,13 @@ func (c *DistributedCB) Execute(ctx context.Context, req func() (interface{}, er
 
 	return res, nil
 }
+
+func (c *DistributedCB) IsOpen(ctx context.Context) bool {
+    stateKey := "cb:state:" + c.name
+    n, err := c.rdb.Exists(ctx, stateKey).Result()
+    if err != nil {
+        // Redis çöktüyse devreyi kapalı say (Fail-Open)
+        return false
+    }
+    return n > 0
+}

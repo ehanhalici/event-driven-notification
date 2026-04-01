@@ -4,15 +4,17 @@ import (
 	"errors"
 	"os"
 	"log/slog"
+	"strconv"
 	"github.com/joho/godotenv"
 )
 
 type Config struct {
 	DatabaseURL  string
 	RedisURL     string
-	KafkaBroker string
+	KafkaBroker  string
 	WebhookURL   string
 	APIPort      string
+	MaxRetries   int
 }
 
 // Load, önce .env dosyasını arar, yoksa sistem ortam değişkenlerini okur.
@@ -22,9 +24,10 @@ func Load() *Config {
 	return &Config{
 		DatabaseURL:  getEnv("DATABASE_URL", "postgres://localhost:5432/notifications_db"),
 		RedisURL:     getEnv("REDIS_URL", "localhost:6379"),
-		KafkaBroker: getEnv("KAFKA_BROKER", "localhost:9092"),
+		KafkaBroker:  getEnv("KAFKA_BROKER", "localhost:9092"),
 		WebhookURL:   getEnv("WEBHOOK_URL", "https://webhook.site/default"),
 		APIPort:      getEnv("API_PORT", ":8080"),
+		MaxRetries:   getIntEnv("MAX_RETRIES", 3),
 	}
 }
 
@@ -33,6 +36,16 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func getIntEnv(key string, fallback int) int {
+    if value, exists := os.LookupEnv(key); exists {
+        i, err := strconv.Atoi(value)
+        if err == nil {
+            return i
+        }
+        slog.Warn("Gecersiz int deger", "key", key, "value", value)}
+    return fallback
 }
 
 func (c *Config) Validate() error {

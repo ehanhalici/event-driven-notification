@@ -124,24 +124,40 @@ func main() {
 			// Worker'lar (Relay değil) mesajı işlerken statüyü kalıcı olarak 'processing' yapar.
 			// Eğer worker Kafka'dan mesajı alıp, API'ye istek atarken çökerse, mesaj 'processing' statüsünde kalır.
 			// Aşağıdaki Atomik CTE, bu zombileri bulur ve Kafka'ya yeniden atılması için Outbox'a geri besler!
-		result, err := dbPool.Exec(ctx, `
-			WITH zombie_notifications AS (
+
+		query := `
+			WITH updated_zombies AS (
 				UPDATE notifications 
-				SET status = 'pending', updated_at = NOW()
-				WHERE status = 'processing' AND updated_at < NOW() - INTERVAL '5 minutes'
-				RETURNING id, recipient, channel, content, priority, correlation_id
+				SET 
+					status = CASE 
+						WHEN retry_count < $1 THEN 'pending'::varchar 
+						ELSE 'failed_permanently'::varchar 
+					END,
+					retry_count = CASE 
+						WHEN retry_count < $1 THEN retry_count + 1 
+						ELSE retry_count 
+					END,
+					updated_at = NOW()
+				WHERE status = 'processing' 
+				  AND updated_at < NOW() - INTERVAL '5 minutes'
+				RETURNING id, status, channel, recipient, content, priority, correlation_id
 			)
 			INSERT INTO outbox_events (aggregate_id, event_type, payload)
-			SELECT id, 'ZombieRecovery', jsonb_build_object(
-				'id', id, 
-				'recipient', recipient, 
-				'channel', channel, 
-				'content', content, 
-				'priority', priority,
-				'correlation_id', correlation_id
-			)
-			FROM zombie_notifications;
-		`)
+			SELECT 
+				id, 
+				'NotificationCreated',
+				jsonb_build_object(
+					'id', id,
+					'channel', channel,
+					'recipient', recipient,
+					'content', content,
+                    'priority', priority,
+					'correlation_id', correlation_id
+				)
+			FROM updated_zombies 
+			WHERE status = 'pending'
+        `
+		result, err := dbPool.Exec(ctx, query, cfg.MaxRetries)
 		if err != nil {
 			slog.Error("Zombie notification kurtarma hatasi", "err", err)
 		} else {

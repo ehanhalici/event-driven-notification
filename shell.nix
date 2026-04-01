@@ -17,6 +17,9 @@ pkgs.mkShell {
     curl
     go-migrate
     go-swag
+
+    tlaps
+    tlaplus
   ];
 
   shellHook = ''

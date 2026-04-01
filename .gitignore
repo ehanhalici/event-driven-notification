@@ -12,6 +12,9 @@
 .gocache/
 .go/
 
+# Proof cache
+proof/states/
+
 # Environment files (sensitive data)
 .env
 

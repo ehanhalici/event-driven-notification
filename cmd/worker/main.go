@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"sync/atomic"
 	"time"
 
 	"insider-notification/internal/circuitbreaker"
@@ -34,6 +35,8 @@ func main() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	var isFatal atomic.Bool
 
 	// İşletim sistemi sinyallerini dinle (SIGINT, SIGTERM)
 	sigChan := make(chan os.Signal, 1)
@@ -83,6 +86,7 @@ func main() {
 		DLQWriter:  dlqWriter,
 		CB:         distCB, // [GÜNCELLENDİ]
 		WebhookURL: cfg.WebhookURL,
+		MaxRetries: cfg.MaxRetries,
 	}
 
 	slog.Info("Worker basladi. Kafka topic dinleniyor...")
@@ -90,14 +94,13 @@ func main() {
 	// Worker havuzlarını beklemesi için WaitGroup
 	var wg sync.WaitGroup
 
-	// YÜZDELİK GOROUTINE DAĞILIMLARI (Toplam 100)
-	// %60 High Priority
-	startConsumerGroup(ctx, &wg, "notifications-high", processor, 60, cfg)
-	// %30 Normal Priority
-	startConsumerGroup(ctx, &wg, "notifications-normal", processor, 30, cfg)
-	// %10 Low Priority
-	startConsumerGroup(ctx, &wg, "notifications-low", processor, 10, cfg)
-
+	// %60 High Priority (cancel parametresi eklendi)
+    startConsumerGroup(ctx, cancel, &wg, "notifications-high", processor, 60, cfg, &isFatal)
+    // %30 Normal Priority
+    startConsumerGroup(ctx, cancel, &wg, "notifications-normal", processor, 30, cfg, &isFatal)
+    // %10 Low Priority
+    startConsumerGroup(ctx, cancel, &wg, "notifications-low", processor, 10, cfg, &isFatal)
+	
 	slog.Info("Worker havuzlari %60 (High), %30 (Med), %10 (Low) oraninda baslatildi.")
 
 	go func() {
@@ -111,6 +114,12 @@ func main() {
 
 	// Tüm havuzlar kapanana kadar ana thredi beklet
 	wg.Wait()
+
+	if isFatal.Load() {
+		slog.Error("Fatal hata nedeniyle sistem kapaniyor. (Exit Code: 1)")
+		os.Exit(1)
+	}
+	
 	slog.Info("Sistem guvenle kapatildi.")
 }
 
@@ -119,8 +128,7 @@ func main() {
 // tamamen boşta (IDLE) bekler ve network/memory sızıntısına yol açar.
 // Doğru tasarım: Kafka'dan tek bir Reader ile veriyi olabildiğince hızlı çekip (Fetch),
 // Go channel'lar vasıtasıyla N adet yerel Goroutine (Worker) havuzuna dağıtmaktır.
-func startConsumerGroup(ctx context.Context, globalWg *sync.WaitGroup, topic string, processor *internalworker.Processor, workerCount int, cfg *config.Config) {
-
+func startConsumerGroup(ctx context.Context, cancelFunc context.CancelFunc, globalWg *sync.WaitGroup, topic string, processor *internalworker.Processor, workerCount int, cfg *config.Config, isFatal *atomic.Bool) {
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:  []string{cfg.KafkaBroker},
 		GroupID:  "notification-workers",
@@ -143,28 +151,44 @@ func startConsumerGroup(ctx context.Context, globalWg *sync.WaitGroup, topic str
 	// -------------------------------------------------------------
 	// 1. WORKER HAVUZUNU (Pool) BAŞLAT
 	// -------------------------------------------------------------
+
 	for i := 0; i < workerCount; i++ {
-		globalWg.Add(1)
-		localWg.Add(1)
+        globalWg.Add(1)
+        localWg.Add(1)
 
-		go func(workerID int) {
-			defer globalWg.Done()
-			defer localWg.Done()
+        go func(workerID int) {
+            defer globalWg.Done()
+            defer localWg.Done()
 
-			slog.Info("Worker hazir", "topic", topic, "worker_id", workerID)
+            slog.Info("Worker hazir", "topic", topic, "worker_id", workerID)
 
-			// Kanal açık olduğu sürece (Fetch devam ettikçe) mesajları sırayla al ve işle
-			for msg := range msgChan {
-				metrics.ActiveWorkers.WithLabelValues(topic).Inc()
-				metrics.InFlightMessages.WithLabelValues(topic).Dec()
-				processor.Process(ctx, msg, tracker)
+            // Kanal açık olduğu sürece (Fetch devam ettikçe) mesajları sırayla al ve işle
+            for msg := range msgChan {
+                metrics.ActiveWorkers.WithLabelValues(topic).Inc()
+                metrics.InFlightMessages.WithLabelValues(topic).Dec()
+
+				// Ana ctx'in değerlerini (Value) alır ama iptal sinyalini (Cancel) KOPARIR.
+				detachedCtx := context.WithoutCancel(ctx)
+				
+				// Buna 15 saniyelik kesin bir sınır koyarız.
+				msgCtx, msgCancel := context.WithTimeout(detachedCtx, 15*time.Second)
+
+				// Zehirli Worker Kontrolü (Fail-Fast)
+				if err := processor.Process(msgCtx, msg, tracker); err != nil {
+					slog.Error("KRİTİK HATA: Worker zehirlendi! Uygulama kapatilip yeniden baslatilacak...", 
+						"topic", topic, "worker_id", workerID, "error", err)
+					
+					isFatal.Store(true)
+					cancelFunc()
+				}
+
+				msgCancel() // Döngü bitiminde izole context'i temizle
 				metrics.ActiveWorkers.WithLabelValues(topic).Dec()
 			}
-
-			slog.Info("Worker kapaniyor...", "topic", topic, "worker_id", workerID)
-		}(i)
-	}
-
+            slog.Info("Worker kapaniyor...", "topic", topic, "worker_id", workerID)
+        }(i)
+    }
+	
 	// -------------------------------------------------------------
 	// 2. KAFKA FETCHER (Okuyucu) GOROUTINE BAŞLAT
 	// -------------------------------------------------------------
@@ -173,8 +197,25 @@ func startConsumerGroup(ctx context.Context, globalWg *sync.WaitGroup, topic str
 		defer globalWg.Done()
 
 		slog.Info("Kafka Fetcher baslatildi", "topic", topic)
-
+FetcherLoop:
 		for {
+
+			// ---> [KRİTİK MİMARİ KALKAN]: CONSUMER PAUSE (BACKPRESSURE) <---
+			// Eğer Devre Kesici (Circuit Breaker) AÇIK ise (Webhook çöktüyse),
+			// Kafka'dan yeni mesaj ÇEKME! Musluğu kapat.
+			// Bu kalkan, veritabanını "Retry Fırtınası" saldırısından korur.
+			for processor.CB.IsOpen(ctx) {
+				slog.Warn("Webhook çöktü (Devre Açık)! Kafka okuması duraklatıldı, mesajlar Kafka'da bekletiliyor ve DB korunuyor...", "topic", topic)
+				
+				// Sistemin kilitlenmemesi (SIGTERM dinleyebilmesi) ve devrenin 
+				// Half-Open (Yarı Açık) duruma geçmesini beklemek için 5 saniye bekle.
+				select {
+				case <-ctx.Done():
+					break FetcherLoop // Kapanış sinyali gelirse çık
+				case <-time.After(5 * time.Second):
+					// 5 saniye bitti, döngü başa dönecek ve CB.IsOpen() tekrar kontrol edilecek.
+				}
+			}
 			// Sadece Fetch işlemi yap, ağır olan "Process" işlemini Worker'lara bırak
 			msg, err := reader.FetchMessage(ctx)
 			if err != nil {
@@ -190,10 +231,16 @@ func startConsumerGroup(ctx context.Context, globalWg *sync.WaitGroup, topic str
 			tracker.Track(msg)
 			metrics.InFlightMessages.WithLabelValues(topic).Inc()
 			// Okunan mesajı havuza (Worker'lara) gönder
-			msgChan <- msg
+			select {
+			case msgChan <- msg:
+				// Mesaj başarıyla worker havuzuna gönderildi
+			case <-ctx.Done():
+				// Eğer worker'lar yavaş kalıp kuyruk dolduysa ve tam o an shutdown geldiyse,
+				// sonsuza kadar kilitlenmek yerine kapanış sürecini başlat.
+				slog.Info("Kuyruk doluyken kapanis sinyali geldi, Fetcher durduruluyor", "topic", topic)
+				break FetcherLoop
+			}
 		}
-
-		// --- GRACEFUL SHUTDOWN (ZARİF KAPANIŞ) KOREOGRAFİSİ ---
 
 		// 1. Önce kanalı kapatıyoruz ki Worker'lar yeni mesaj gelmeyeceğini anlasın
 		// ve ellerindeki mevcut mesajları bitirince for-range döngüsünden çıksınlar.
